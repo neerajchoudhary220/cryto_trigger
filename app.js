@@ -1,13 +1,8 @@
-require("dotenv").config();
+const path = require("path");
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const fs = require("fs");
-const path = require("path");
-
-// Silence all console logs and errors to prevent PM2 log bloating
-console.log = () => {};
-console.error = () => {};
-
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -17,6 +12,10 @@ if (!token) {
   console.error("Error: TELEGRAM_BOT_TOKEN is not defined in .env file.");
   process.exit(1);
 }
+
+// Silence all console logs and errors to prevent PM2 log bloating
+console.log = () => {};
+console.error = () => {};
 
 // Bot initialize with polling enabled so it can receive messages
 const bot = new TelegramBot(token, { polling: true });
