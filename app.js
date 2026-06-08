@@ -1,0 +1,762 @@
+require("dotenv").config();
+const TelegramBot = require("node-telegram-bot-api");
+const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
+const token = process.env.TELEGRAM_BOT_TOKEN;
+const TRIGGERS_FILE = path.join(__dirname, "triggers.json");
+
+if (!token) {
+  console.error("Error: TELEGRAM_BOT_TOKEN is not defined in .env file.");
+  process.exit(1);
+}
+
+// Bot initialize with polling enabled so it can receive messages
+const bot = new TelegramBot(token, { polling: true });
+
+// User conversation states
+const userStates = {};
+
+// ─── REPLY KEYBOARD (Persistent bottom buttons) ──────────────────────────────
+const mainKeyboard = {
+  keyboard: [
+    [{ text: "➕ Add Alert" }, { text: "📋 List Alerts" }],
+    [{ text: "💰 Check Price" }, { text: "❓ Help" }]
+  ],
+  resize_keyboard: true
+};
+
+// ─── DATABASE FUNCTIONS ───────────────────────────────────────────────────────
+
+function readTriggers() {
+  try {
+    if (!fs.existsSync(TRIGGERS_FILE)) {
+      fs.writeFileSync(TRIGGERS_FILE, JSON.stringify([], null, 2));
+      return [];
+    }
+    const data = fs.readFileSync(TRIGGERS_FILE, "utf8");
+    return JSON.parse(data);
+  } catch (error) {
+    console.error("Error reading triggers file:", error.message);
+    return [];
+  }
+}
+
+function writeTriggers(triggers) {
+  try {
+    fs.writeFileSync(TRIGGERS_FILE, JSON.stringify(triggers, null, 2));
+  } catch (error) {
+    console.error("Error writing triggers file:", error.message);
+  }
+}
+
+// ─── PRICE UTILITIES ──────────────────────────────────────────────────────────
+
+// Verify symbol and get current price from MEXC
+async function verifySymbolAndGetPrice(symbol) {
+  try {
+    const cleanSymbol = symbol.trim().toUpperCase();
+    const response = await axios.get(`https://api.mexc.com/api/v3/ticker/price?symbol=${cleanSymbol}`);
+    if (response.data && response.data.price) {
+      return parseFloat(response.data.price);
+    }
+    return null;
+  } catch (error) {
+    return null;
+  }
+}
+
+// Fetch prices for a list of symbols efficiently
+async function getPricesForSymbols(symbols) {
+  const prices = {};
+  if (symbols.length === 0) return prices;
+
+  // If 5 or fewer symbols, fetch in parallel. Otherwise, fetch all in one request.
+  if (symbols.length <= 5) {
+    await Promise.all(
+      symbols.map(async (symbol) => {
+        const price = await verifySymbolAndGetPrice(symbol);
+        if (price !== null) {
+          prices[symbol] = price;
+        }
+      })
+    );
+  } else {
+    try {
+      const response = await axios.get("https://api.mexc.com/api/v3/ticker/price");
+      if (Array.isArray(response.data)) {
+        for (const item of response.data) {
+          if (symbols.includes(item.symbol)) {
+            prices[item.symbol] = parseFloat(item.price);
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Error fetching all prices from MEXC:", error.message);
+    }
+  }
+  return prices;
+}
+
+// Get live dashboard of top cryptos
+async function getDefaultMarketDashboard() {
+  const prices = await getPricesForSymbols(["BTCUSDT", "ETHUSDT"]);
+  const btcPrice = prices["BTCUSDT"] ? `$${prices["BTCUSDT"]}` : "Fetching...";
+  const ethPrice = prices["ETHUSDT"] ? `$${prices["ETHUSDT"]}` : "Fetching...";
+  return `💰 *Live Market Status:*\n• *BTCUSDT*: ${btcPrice}\n• *ETHUSDT*: ${ethPrice}`;
+}
+
+// ─── HELPER FUNCTIONS ─────────────────────────────────────────────────────────
+
+function getHelpMessage() {
+  return `👋 *Welcome to the Crypto Price Alert Bot!*
+Aap yahan kisi bhi coin par dynamic triggers set kar sakte hain.
+
+💡 *Commands:*
+➕ \`/add <COIN> <PRICE>\` - Naya price trigger set karein
+   _Example:_ \`/add BTCUSDT 69000\` or \`/add SIREN 1.23\`
+📋 \`/list\` - Apne saare active triggers dekhein aur manage karein
+✏️ \`/edit <ID> <NEW_PRICE>\` - Alert ki price change karein
+❌ \`/delete <ID>\` - Kisi alert ko delete karein
+💰 \`/price <COIN>\` - Kisi coin ki live price check karein
+❓ \`/help\` - Yeh instructions fir se dekhne ke liye
+
+*Conversational Flow:*
+Aap bottom menu buttons ka use karke easily alert create, check, aur manage kar sakte hain!`;
+}
+
+// ─── TELEGRAM MESSAGE HANDLERS ────────────────────────────────────────────────
+
+// Handle /start and /help
+bot.onText(/\/start|\/help/, async (msg) => {
+  const chatId = msg.chat.id;
+  userStates[chatId] = null; // Reset state
+
+  const dashboard = await getDefaultMarketDashboard();
+  const opts = {
+    parse_mode: "Markdown",
+    reply_markup: mainKeyboard
+  };
+
+  bot.sendMessage(chatId, `${getHelpMessage()}\n\n${dashboard}`, opts);
+});
+
+// Handle /price <symbol>
+bot.onText(/\/price(?:\s+(\S+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  userStates[chatId] = null; // Reset state
+  
+  let symbol = match[1];
+  if (!symbol) {
+    userStates[chatId] = { action: "check_price_symbol" };
+    return bot.sendMessage(
+      chatId, 
+      "🔍 Konse coin ki price check karni hai? Enter symbol (e.g. BTC, ETH, SIRENUSDT):",
+      { reply_markup: mainKeyboard }
+    );
+  }
+
+  symbol = symbol.toUpperCase();
+  let price = await verifySymbolAndGetPrice(symbol);
+  if (price === null && !symbol.endsWith("USDT")) {
+    const usdtSymbol = symbol + "USDT";
+    const usdtPrice = await verifySymbolAndGetPrice(usdtSymbol);
+    if (usdtPrice !== null) {
+      symbol = usdtSymbol;
+      price = usdtPrice;
+    }
+  }
+
+  if (price === null) {
+    return bot.sendMessage(
+      chatId, 
+      `❌ Symbol *${symbol}* MEXC API par nahi mila.`, 
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  }
+
+  bot.sendMessage(
+    chatId, 
+    `💰 *Live Price:* \`${symbol}\` = *$${price}*`, 
+    { parse_mode: "Markdown", reply_markup: mainKeyboard }
+  );
+});
+
+// Handle /add <symbol> <price>
+bot.onText(/\/add(?:\s+(\S+)\s+(\d+(?:\.\d+)?))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  userStates[chatId] = null; // Reset state
+
+  let symbol = match[1];
+  let priceStr = match[2];
+
+  if (!symbol || !priceStr) {
+    // Start step-by-step wizard
+    userStates[chatId] = { action: "add_symbol" };
+    return bot.sendMessage(
+      chatId,
+      "➕ **Add Alert Wizard:**\nEnter coin symbol (e.g. BTC, ETH, SIRENUSDT):",
+      { reply_markup: mainKeyboard }
+    );
+  }
+
+  symbol = symbol.toUpperCase();
+  const targetPrice = parseFloat(priceStr);
+
+  bot.sendMessage(chatId, `⏳ Checking price for *${symbol}*...`, { parse_mode: "Markdown" });
+
+  let currentPrice = await verifySymbolAndGetPrice(symbol);
+  if (currentPrice === null && !symbol.endsWith("USDT")) {
+    const usdtSymbol = symbol + "USDT";
+    const usdtPrice = await verifySymbolAndGetPrice(usdtSymbol);
+    if (usdtPrice !== null) {
+      symbol = usdtSymbol;
+      currentPrice = usdtPrice;
+    }
+  }
+
+  if (currentPrice === null) {
+    return bot.sendMessage(
+      chatId,
+      `❌ Symbol *${symbol}* MEXC API par nahi mila. Please correct symbol use karein.`,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  }
+
+  // Determine alert direction
+  const direction = currentPrice < targetPrice ? "above" : "below";
+  const newTrigger = {
+    id: Date.now().toString(),
+    symbol,
+    targetPrice,
+    direction,
+    chatId,
+    createdAt: new Date().toISOString()
+  };
+
+  const triggers = readTriggers();
+  triggers.push(newTrigger);
+  writeTriggers(triggers);
+
+  const dirText = direction === "above" ? "above 📈" : "below 📉";
+  bot.sendMessage(
+    chatId,
+    `✅ **Alert Added Successfully!**\n\n` +
+    `🪙 Symbol: *${symbol}*\n` +
+    `💵 Current Price: *$${currentPrice}*\n` +
+    `🎯 Target Price: *$${targetPrice}*\n` +
+    `🔔 Trigger Condition: When price goes *${dirText}*\n` +
+    `🆔 Alert ID: \`${newTrigger.id}\``,
+    { parse_mode: "Markdown", reply_markup: mainKeyboard }
+  );
+});
+
+// Handle /list
+bot.onText(/\/list/, async (msg) => {
+  const chatId = msg.chat.id;
+  userStates[chatId] = null; // Reset state
+  await sendAlertsList(chatId);
+});
+
+// Helper function to format and send the alerts list
+async function sendAlertsList(chatId, messageId = null) {
+  const triggers = readTriggers().filter(t => t.chatId === chatId);
+
+  if (triggers.length === 0) {
+    const text = "ℹ️ Aapka koi bhi active alert nahi hai. Naya alert add karne ke liye \`/add\` use karein.";
+    const opts = { parse_mode: "Markdown", reply_markup: mainKeyboard };
+    if (messageId) {
+      return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, ...opts });
+    } else {
+      return bot.sendMessage(chatId, text, opts);
+    }
+  }
+
+  // Get active symbols to fetch live prices
+  const symbols = [...new Set(triggers.map(t => t.symbol))];
+  const livePrices = await getPricesForSymbols(symbols);
+
+  let responseText = "📋 *Your Active Price Alerts:*\n\n";
+  const keyboard = [];
+
+  triggers.forEach((trigger, idx) => {
+    const livePrice = livePrices[trigger.symbol];
+    const livePriceStr = livePrice !== undefined ? `$${livePrice}` : "Fetching failed";
+    const dirIcon = trigger.direction === "above" ? "📈 Above" : "📉 Below";
+
+    responseText += `🔔 *${idx + 1}. ${trigger.symbol}*\n` +
+                   `   ├ Target: *$${trigger.targetPrice}* (When goes ${dirIcon})\n` +
+                   `   ├ Live Price: *${livePriceStr}*\n` +
+                   `   └ ID: \`${trigger.id}\`\n\n`;
+
+    // Row of buttons for each trigger
+    keyboard.push([
+      { text: `✏️ Edit #${idx + 1}`, callback_data: `edit_${trigger.id}` },
+      { text: `❌ Delete #${idx + 1}`, callback_data: `delete_${trigger.id}` }
+    ]);
+  });
+
+  const opts = {
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: keyboard
+    }
+  };
+
+  if (messageId) {
+    try {
+      await bot.editMessageText(responseText, { chat_id: chatId, message_id: messageId, ...opts });
+    } catch (e) {
+      // If content is identical, editMessageText throws an error. Catch it silently.
+      if (!e.message.includes("message is not modified")) {
+        console.error("Edit message error:", e.message);
+      }
+    }
+  } else {
+    await bot.sendMessage(chatId, responseText, opts);
+  }
+}
+
+// Handle /delete <id>
+bot.onText(/\/delete(?:\s+(\S+))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  userStates[chatId] = null; // Reset state
+
+  const alertId = match[1];
+  if (!alertId) {
+    return bot.sendMessage(
+      chatId, 
+      "⚠️ Usage: \`/delete <ALERT_ID>\`\nExample: \`/delete 1686235492000\`", 
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  }
+
+  const triggers = readTriggers();
+  const index = triggers.findIndex(t => t.id === alertId && t.chatId === chatId);
+
+  if (index === -1) {
+    return bot.sendMessage(
+      chatId, 
+      `❌ Alert ID \`${alertId}\` nahi mila.`, 
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  }
+
+  const deletedSymbol = triggers[index].symbol;
+  const deletedPrice = triggers[index].targetPrice;
+  triggers.splice(index, 1);
+  writeTriggers(triggers);
+
+  const currentPrice = await verifySymbolAndGetPrice(deletedSymbol);
+  const priceMsg = currentPrice !== null ? ` (Current Price: *$${currentPrice}*)` : "";
+
+  bot.sendMessage(
+    chatId, 
+    `🗑️ Alert for *${deletedSymbol}* at *$${deletedPrice}* has been deleted successfully!${priceMsg}`, 
+    { parse_mode: "Markdown", reply_markup: mainKeyboard }
+  );
+});
+
+// Handle /edit <id> <new_price>
+bot.onText(/\/edit(?:\s+(\S+)\s+(\d+(?:\.\d+)?))?/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  userStates[chatId] = null; // Reset state
+
+  const alertId = match[1];
+  const newPriceStr = match[2];
+
+  if (!alertId || !newPriceStr) {
+    return bot.sendMessage(
+      chatId,
+      "⚠️ Usage: \`/edit <ALERT_ID> <NEW_PRICE>\`\nExample: \`/edit 1686235492000 1.25\`",
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  }
+
+  const newPrice = parseFloat(newPriceStr);
+  const triggers = readTriggers();
+  const triggerIdx = triggers.findIndex(t => t.id === alertId && t.chatId === chatId);
+
+  if (triggerIdx === -1) {
+    return bot.sendMessage(
+      chatId, 
+      `❌ Alert ID \`${alertId}\` nahi mila.`, 
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  }
+
+  const trigger = triggers[triggerIdx];
+  bot.sendMessage(chatId, `⏳ Fetching live price for *${trigger.symbol}* to recalculate trigger condition...`, { parse_mode: "Markdown" });
+
+  const currentPrice = await verifySymbolAndGetPrice(trigger.symbol);
+  if (currentPrice === null) {
+    return bot.sendMessage(
+      chatId, 
+      `❌ Error: Could not verify price for ${trigger.symbol}. Try again.`, 
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  }
+
+  // Recalculate direction
+  const direction = currentPrice < newPrice ? "above" : "below";
+  
+  // Update trigger
+  trigger.targetPrice = newPrice;
+  trigger.direction = direction;
+  writeTriggers(triggers);
+
+  bot.sendMessage(
+    chatId,
+    `✅ **Alert Updated Successfully!**\n\n` +
+    `🪙 Symbol: *${trigger.symbol}*\n` +
+    `💵 Current Price: *$${currentPrice}*\n` +
+    `🎯 New Target Price: *$${newPrice}*\n` +
+    `🔔 Trigger Condition: When price goes *${direction === "above" ? "above 📈" : "below 📉"}*`,
+    { parse_mode: "Markdown", reply_markup: mainKeyboard }
+  );
+});
+
+// ─── CALLBACK QUERY HANDLER (Buttons) ──────────────────────────────────────────
+
+bot.on("callback_query", async (callbackQuery) => {
+  const chatId = callbackQuery.message.chat.id;
+  const messageId = callbackQuery.message.message_id;
+  const data = callbackQuery.data;
+
+  // Acknowledge the callback query
+  bot.answerCallbackQuery(callbackQuery.id);
+
+  if (data === "menu_add") {
+    userStates[chatId] = { action: "add_symbol" };
+    await bot.sendMessage(
+      chatId, 
+      "➕ **Add Alert:**\nEnter coin symbol (e.g. BTC, ETH, SIRENUSDT):",
+      { reply_markup: mainKeyboard }
+    );
+  } else if (data === "menu_list") {
+    await sendAlertsList(chatId);
+  } else if (data === "menu_price") {
+    userStates[chatId] = { action: "check_price_symbol" };
+    await bot.sendMessage(
+      chatId, 
+      "🔍 Enter coin symbol (e.g. BTC, ETH, SIRENUSDT):",
+      { reply_markup: mainKeyboard }
+    );
+  } else if (data.startsWith("delete_")) {
+    const alertId = data.substring(7);
+    const triggers = readTriggers();
+    const index = triggers.findIndex(t => t.id === alertId && t.chatId === chatId);
+
+    if (index !== -1) {
+      const sym = triggers[index].symbol;
+      const price = triggers[index].targetPrice;
+      triggers.splice(index, 1);
+      writeTriggers(triggers);
+
+      const currentPrice = await verifySymbolAndGetPrice(sym);
+      const priceMsg = currentPrice !== null ? ` (Current Price: *$${currentPrice}*)` : "";
+
+      await bot.sendMessage(
+        chatId, 
+        `🗑️ Alert for *${sym}* at *$${price}* has been deleted successfully!${priceMsg}`, 
+        { parse_mode: "Markdown", reply_markup: mainKeyboard }
+      );
+      // Refresh the list
+      await sendAlertsList(chatId, messageId);
+    } else {
+      await bot.sendMessage(
+        chatId, 
+        "❌ Alert not found or already deleted.",
+        { reply_markup: mainKeyboard }
+      );
+    }
+  } else if (data.startsWith("edit_")) {
+    const alertId = data.substring(5);
+    const triggers = readTriggers();
+    const trigger = triggers.find(t => t.id === alertId && t.chatId === chatId);
+
+    if (trigger) {
+      userStates[chatId] = { action: "edit_price", alertId: trigger.id, symbol: trigger.symbol };
+      await bot.sendMessage(
+        chatId,
+        `✏️ **Editing Alert for ${trigger.symbol}** (Current Target: $${trigger.targetPrice})\n\n` +
+        `Please type the *new target price*:`,
+        { reply_markup: mainKeyboard }
+      );
+    } else {
+      await bot.sendMessage(
+        chatId, 
+        "❌ Alert not found.",
+        { reply_markup: mainKeyboard }
+      );
+    }
+  }
+});
+
+// ─── CONVERSATIONAL WIZARD & KEYBOARD TEXT HANDLER ────────────────────────────
+
+bot.on("message", async (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text ? msg.text.trim() : "";
+
+  // Ignore commands handled by bot.onText
+  if (text.startsWith("/")) return;
+
+  // Handle Bottom Reply Keyboard Clicks
+  if (text === "➕ Add Alert") {
+    userStates[chatId] = { action: "add_symbol" };
+    return bot.sendMessage(
+      chatId,
+      "➕ **Add Alert Wizard:**\nEnter coin symbol (e.g. BTC, ETH, SIRENUSDT):",
+      { reply_markup: mainKeyboard }
+    );
+  }
+
+  if (text === "📋 List Alerts") {
+    userStates[chatId] = null;
+    return sendAlertsList(chatId);
+  }
+
+  if (text === "💰 Check Price") {
+    userStates[chatId] = { action: "check_price_symbol" };
+    return bot.sendMessage(
+      chatId,
+      "🔍 Enter coin symbol to check live price (e.g. BTC, ETH, SIRENUSDT):",
+      { reply_markup: mainKeyboard }
+    );
+  }
+
+  if (text === "❓ Help") {
+    userStates[chatId] = null;
+    const dashboard = await getDefaultMarketDashboard();
+    return bot.sendMessage(
+      chatId,
+      `${getHelpMessage()}\n\n${dashboard}`,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  }
+
+  const state = userStates[chatId];
+  if (!state) return;
+
+  if (state.action === "check_price_symbol") {
+    userStates[chatId] = null; // Reset state
+    let symbol = text.toUpperCase();
+    
+    bot.sendMessage(chatId, `⏳ Fetching price for *${symbol}*...`, { parse_mode: "Markdown" });
+    
+    let price = await verifySymbolAndGetPrice(symbol);
+    if (price === null && !symbol.endsWith("USDT")) {
+      const usdtSymbol = symbol + "USDT";
+      const usdtPrice = await verifySymbolAndGetPrice(usdtSymbol);
+      if (usdtPrice !== null) {
+        symbol = usdtSymbol;
+        price = usdtPrice;
+      }
+    }
+
+    if (price === null) {
+      return bot.sendMessage(
+        chatId, 
+        `❌ Symbol *${symbol}* MEXC API par nahi mila.`, 
+        { parse_mode: "Markdown", reply_markup: mainKeyboard }
+      );
+    }
+
+    bot.sendMessage(
+      chatId, 
+      `💰 *Live Price:* \`${symbol}\` = *$${price}*`, 
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+
+  } else if (state.action === "add_symbol") {
+    let symbol = text.toUpperCase();
+    
+    bot.sendMessage(chatId, `⏳ Verifying symbol *${symbol}* on MEXC...`, { parse_mode: "Markdown" });
+
+    let price = await verifySymbolAndGetPrice(symbol);
+    if (price === null && !symbol.endsWith("USDT")) {
+      const usdtSymbol = symbol + "USDT";
+      const usdtPrice = await verifySymbolAndGetPrice(usdtSymbol);
+      if (usdtPrice !== null) {
+        symbol = usdtSymbol;
+        price = usdtPrice;
+      }
+    }
+
+    if (price === null) {
+      return bot.sendMessage(
+        chatId,
+        `❌ Symbol *${symbol}* MEXC par nahi mila.\n\nPlease enter a valid symbol (e.g. BTC, ETH, SIRENUSDT):`,
+        { reply_markup: mainKeyboard }
+      );
+    }
+
+    // Symbol is valid, move to price step
+    userStates[chatId] = { action: "add_price", symbol, currentPrice: price };
+    bot.sendMessage(
+      chatId,
+      `💰 Current price of *${symbol}* is *$${price}*.\n\nNow, enter your *target price* for the alert:`,
+      { reply_markup: mainKeyboard }
+    );
+
+  } else if (state.action === "add_price") {
+    const targetPrice = parseFloat(text);
+    const { symbol, currentPrice } = state;
+
+    if (isNaN(targetPrice) || targetPrice <= 0) {
+      return bot.sendMessage(
+        chatId, 
+        `⚠️ Please enter a valid positive number for the target price:\n(Current price of *${symbol}* is *$${currentPrice}*)`,
+        { parse_mode: "Markdown", reply_markup: mainKeyboard }
+      );
+    }
+
+    userStates[chatId] = null; // Clear state
+
+    const direction = currentPrice < targetPrice ? "above" : "below";
+    const newTrigger = {
+      id: Date.now().toString(),
+      symbol,
+      targetPrice,
+      direction,
+      chatId,
+      createdAt: new Date().toISOString()
+    };
+
+    const triggers = readTriggers();
+    triggers.push(newTrigger);
+    writeTriggers(triggers);
+
+    const dirText = direction === "above" ? "above 📈" : "below 📉";
+    bot.sendMessage(
+      chatId,
+      `✅ **Alert Added Successfully!**\n\n` +
+      `🪙 Symbol: *${symbol}*\n` +
+      `💵 Current Price: *$${currentPrice}*\n` +
+      `🎯 Target Price: *$${targetPrice}*\n` +
+      `🔔 Trigger Condition: When price goes *${dirText}*\n` +
+      `🆔 Alert ID: \`${newTrigger.id}\``,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+
+  } else if (state.action === "edit_price") {
+    const newPrice = parseFloat(text);
+    const { alertId, symbol } = state;
+
+    if (isNaN(newPrice) || newPrice <= 0) {
+      const currentPrice = await verifySymbolAndGetPrice(symbol);
+      const priceMsg = currentPrice !== null ? `\n(Current price of *${symbol}* is *$${currentPrice}*)` : "";
+      return bot.sendMessage(
+        chatId, 
+        `⚠️ Please enter a valid positive number for the target price:${priceMsg}`,
+        { parse_mode: "Markdown", reply_markup: mainKeyboard }
+      );
+    }
+
+    userStates[chatId] = null; // Clear state
+
+    const triggers = readTriggers();
+    const triggerIdx = triggers.findIndex(t => t.id === alertId && t.chatId === chatId);
+
+    if (triggerIdx === -1) {
+      return bot.sendMessage(
+        chatId, 
+        "❌ Alert not found or was deleted during edit.",
+        { reply_markup: mainKeyboard }
+      );
+    }
+
+    const trigger = triggers[triggerIdx];
+    bot.sendMessage(chatId, `⏳ Fetching live price for *${symbol}* to recalculate trigger condition...`, { parse_mode: "Markdown" });
+
+    const currentPrice = await verifySymbolAndGetPrice(symbol);
+    if (currentPrice === null) {
+      return bot.sendMessage(
+        chatId, 
+        `❌ Error: Could not fetch price. Try editing using \`/edit ${alertId} ${newPrice}\``, 
+        { parse_mode: "Markdown", reply_markup: mainKeyboard }
+      );
+    }
+
+    const direction = currentPrice < newPrice ? "above" : "below";
+    trigger.targetPrice = newPrice;
+    trigger.direction = direction;
+    writeTriggers(triggers);
+
+    bot.sendMessage(
+      chatId,
+      `✅ **Alert Updated Successfully!**\n\n` +
+      `🪙 Symbol: *${symbol}*\n` +
+      `💵 Current Price: *$${currentPrice}*\n` +
+      `🎯 New Target Price: *$${newPrice}*\n` +
+      `🔔 Trigger Condition: When price goes *${direction === "above" ? "above 📈" : "below 📉"}*`,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  }
+});
+
+// ─── PRICE MONITORING ENGINE ─────────────────────────────────────────────────
+
+async function monitorMarket() {
+  console.log("Price monitoring engine started. Checking prices every 10 seconds...");
+
+  setInterval(async () => {
+    try {
+      const triggers = readTriggers();
+      if (triggers.length === 0) return;
+
+      // Get unique symbols currently in triggers
+      const uniqueSymbols = [...new Set(triggers.map(t => t.symbol))];
+      const livePrices = await getPricesForSymbols(uniqueSymbols);
+
+      let triggersChanged = false;
+      const remainingTriggers = [];
+
+      for (const trigger of triggers) {
+        const currentPrice = livePrices[trigger.symbol];
+        if (currentPrice === undefined || currentPrice === null) {
+          remainingTriggers.push(trigger);
+          continue;
+        }
+
+        let isTriggered = false;
+        if (trigger.direction === "above" && currentPrice >= trigger.targetPrice) {
+          isTriggered = true;
+        } else if (trigger.direction === "below" && currentPrice <= trigger.targetPrice) {
+          isTriggered = true;
+        }
+
+        if (isTriggered) {
+          triggersChanged = true;
+          const dirText = trigger.direction === "above" ? "crossed ABOVE 📈" : "crossed BELOW 📉";
+          const message = `🚨 *PRICE ALERT TRIGGERED!* 🚨\n\n` +
+                          `🪙 Symbol: *${trigger.symbol}*\n` +
+                          `🎯 Target Price: *$${trigger.targetPrice}*\n` +
+                          `💵 Current Price: *$${currentPrice}*\n\n` +
+                          `Price has *${dirText}* your alert target. This alert has been removed.`;
+          
+          try {
+            await bot.sendMessage(trigger.chatId, message, { parse_mode: "Markdown", reply_markup: mainKeyboard });
+            console.log(`Alert sent for ${trigger.symbol} to chatId ${trigger.chatId} at price ${currentPrice}`);
+          } catch (error) {
+            console.error(`Error sending telegram alert to ${trigger.chatId}:`, error.message);
+          }
+        } else {
+          remainingTriggers.push(trigger);
+        }
+      }
+
+      if (triggersChanged) {
+        writeTriggers(remainingTriggers);
+      }
+    } catch (err) {
+      console.error("Error in monitorMarket loop:", err.message);
+    }
+  }, 10000);
+}
+
+// Start the monitoring engine
+monitorMarket();
