@@ -4,6 +4,11 @@ const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 
+// Silence all console logs and errors to prevent PM2 log bloating
+console.log = () => {};
+console.error = () => {};
+
+
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const token = process.env.TELEGRAM_BOT_TOKEN;
 const TRIGGERS_FILE = path.join(__dirname, "triggers.json");
