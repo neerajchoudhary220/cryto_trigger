@@ -119,10 +119,10 @@ function getHelpMessage() {
 Aap yahan kisi bhi coin par dynamic triggers set kar sakte hain.
 
 💡 *Commands:*
-➕ \`/add <COIN> <PRICE>\` - Naya price trigger set karein
-   _Example:_ \`/add BTCUSDT 69000\` or \`/add SIREN 1.23\`
+➕ \`/add <COIN> <PRICE> [above/below]\` - Naya price trigger set karein
+   _Example:_ \`/add BTCUSDT 69000 above\` or \`/add SIREN 1.20 below\`
 📋 \`/list\` - Apne saare active triggers dekhein aur manage karein
-✏️ \`/edit <ID> <NEW_PRICE>\` - Alert ki price change karein
+✏️ \`/edit <ID> <NEW_PRICE> [above/below]\` - Alert ki price change karein
 ❌ \`/delete <ID>\` - Kisi alert ko delete karein
 💰 \`/price <COIN>\` - Kisi coin ki live price check karein
 ❓ \`/help\` - Yeh instructions fir se dekhne ke liye
@@ -157,7 +157,7 @@ bot.onText(/\/price(?:\s+(\S+))?/, async (msg, match) => {
     userStates[chatId] = { action: "check_price_symbol" };
     return bot.sendMessage(
       chatId, 
-      "🔍 Konse coin ki price check karni hai? Enter symbol (e.g. BTC, ETH, SIRENUSDT):",
+      "🔍 Which coin price do you want to check? Enter symbol (e.g. BTC, ETH, SIRENUSDT):",
       { reply_markup: mainKeyboard }
     );
   }
@@ -176,7 +176,7 @@ bot.onText(/\/price(?:\s+(\S+))?/, async (msg, match) => {
   if (price === null) {
     return bot.sendMessage(
       chatId, 
-      `❌ Symbol *${symbol}* MEXC API par nahi mila.`, 
+      `❌ Symbol *${symbol}* not found on MEXC API.`, 
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   }
@@ -188,13 +188,14 @@ bot.onText(/\/price(?:\s+(\S+))?/, async (msg, match) => {
   );
 });
 
-// Handle /add <symbol> <price>
-bot.onText(/\/add(?:\s+(\S+)\s+(\d+(?:\.\d+)?))?/, async (msg, match) => {
+// Handle /add <symbol> <price> [direction]
+bot.onText(/\/add(?:\s+(\S+)\s+(\d+(?:\.\d+)?)(?:\s+(above|below|up|down|go_above|go_below))?)?/, async (msg, match) => {
   const chatId = msg.chat.id;
   userStates[chatId] = null; // Reset state
 
   let symbol = match[1];
   let priceStr = match[2];
+  let dirInput = match[3];
 
   if (!symbol || !priceStr) {
     // Start step-by-step wizard
@@ -224,36 +225,63 @@ bot.onText(/\/add(?:\s+(\S+)\s+(\d+(?:\.\d+)?))?/, async (msg, match) => {
   if (currentPrice === null) {
     return bot.sendMessage(
       chatId,
-      `❌ Symbol *${symbol}* MEXC API par nahi mila. Please correct symbol use karein.`,
+      `❌ Symbol *${symbol}* not found on MEXC API. Please enter a valid symbol.`,
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   }
 
-  // Determine alert direction
-  const direction = currentPrice < targetPrice ? "above" : "below";
-  const newTrigger = {
-    id: Date.now().toString(),
-    symbol,
-    targetPrice,
-    direction,
-    chatId,
-    createdAt: new Date().toISOString()
-  };
+  // Check if direction is provided in command
+  if (dirInput) {
+    let direction = "above";
+    if (["below", "down", "go_below"].includes(dirInput.toLowerCase())) {
+      direction = "below";
+    }
 
-  const triggers = readTriggers();
-  triggers.push(newTrigger);
-  writeTriggers(triggers);
+    const newTrigger = {
+      id: Date.now().toString(),
+      symbol,
+      targetPrice,
+      direction,
+      chatId,
+      createdAt: new Date().toISOString()
+    };
 
-  const dirText = direction === "above" ? "above 📈" : "below 📉";
+    const triggers = readTriggers();
+    triggers.push(newTrigger);
+    writeTriggers(triggers);
+
+    const dirText = direction === "above" ? "above 📈" : "below 📉";
+    return bot.sendMessage(
+      chatId,
+      `✅ **Alert Added Successfully!**\n\n` +
+      `🪙 Symbol: *${symbol}*\n` +
+      `💵 Current Price: *$${currentPrice}*\n` +
+      `🎯 Target Price: *$${targetPrice}*\n` +
+      `🔔 Trigger Condition: When price goes *${dirText}*\n` +
+      `🆔 Alert ID: \`${newTrigger.id}\``,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  }
+
+  // If direction is NOT provided in command, prompt for it manually using buttons
+  userStates[chatId] = { action: "add_direction", symbol, targetPrice, currentPrice };
+  const inlineKeyboard = [
+    [
+      { text: "📈 Go Above", callback_data: "setdir_above" },
+      { text: "📉 Go Below", callback_data: "setdir_below" }
+    ]
+  ];
   bot.sendMessage(
     chatId,
-    `✅ **Alert Added Successfully!**\n\n` +
-    `🪙 Symbol: *${symbol}*\n` +
-    `💵 Current Price: *$${currentPrice}*\n` +
     `🎯 Target Price: *$${targetPrice}*\n` +
-    `🔔 Trigger Condition: When price goes *${dirText}*\n` +
-    `🆔 Alert ID: \`${newTrigger.id}\``,
-    { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    `Current price of *${symbol}* is *$${currentPrice}*.\n\n` +
+    `Choose when to trigger the alert:`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: inlineKeyboard
+      }
+    }
   );
 });
 
@@ -269,7 +297,7 @@ async function sendAlertsList(chatId, messageId = null) {
   const triggers = readTriggers().filter(t => t.chatId === chatId);
 
   if (triggers.length === 0) {
-    const text = "ℹ️ Aapka koi bhi active alert nahi hai. Naya alert add karne ke liye \`/add\` use karein.";
+    const text = "ℹ️ You don't have any active alerts. Use \`/add\` to set a new alert.";
     const opts = { parse_mode: "Markdown", reply_markup: mainKeyboard };
     if (messageId) {
       return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, ...opts });
@@ -343,7 +371,7 @@ bot.onText(/\/delete(?:\s+(\S+))?/, async (msg, match) => {
   if (index === -1) {
     return bot.sendMessage(
       chatId, 
-      `❌ Alert ID \`${alertId}\` nahi mila.`, 
+      `❌ Alert ID \`${alertId}\` not found.`, 
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   }
@@ -363,18 +391,19 @@ bot.onText(/\/delete(?:\s+(\S+))?/, async (msg, match) => {
   );
 });
 
-// Handle /edit <id> <new_price>
-bot.onText(/\/edit(?:\s+(\S+)\s+(\d+(?:\.\d+)?))?/, async (msg, match) => {
+// Handle /edit <id> <new_price> [direction]
+bot.onText(/\/edit(?:\s+(\S+)\s+(\d+(?:\.\d+)?)(?:\s+(above|below|up|down|go_above|go_below))?)?/, async (msg, match) => {
   const chatId = msg.chat.id;
   userStates[chatId] = null; // Reset state
 
   const alertId = match[1];
   const newPriceStr = match[2];
+  const dirInput = match[3];
 
   if (!alertId || !newPriceStr) {
     return bot.sendMessage(
       chatId,
-      "⚠️ Usage: \`/edit <ALERT_ID> <NEW_PRICE>\`\nExample: \`/edit 1686235492000 1.25\`",
+      "⚠️ Usage: \`/edit <ALERT_ID> <NEW_PRICE> [above/below]\`\nExample: \`/edit 1686235492000 1.25 below\`",
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   }
@@ -386,13 +415,13 @@ bot.onText(/\/edit(?:\s+(\S+)\s+(\d+(?:\.\d+)?))?/, async (msg, match) => {
   if (triggerIdx === -1) {
     return bot.sendMessage(
       chatId, 
-      `❌ Alert ID \`${alertId}\` nahi mila.`, 
+      `❌ Alert ID \`${alertId}\` not found.`, 
       { parse_mode: "Markdown", reply_markup: mainKeyboard }
     );
   }
 
   const trigger = triggers[triggerIdx];
-  bot.sendMessage(chatId, `⏳ Fetching live price for *${trigger.symbol}* to recalculate trigger condition...`, { parse_mode: "Markdown" });
+  bot.sendMessage(chatId, `⏳ Fetching live price for *${trigger.symbol}*...`, { parse_mode: "Markdown" });
 
   const currentPrice = await verifySymbolAndGetPrice(trigger.symbol);
   if (currentPrice === null) {
@@ -403,22 +432,46 @@ bot.onText(/\/edit(?:\s+(\S+)\s+(\d+(?:\.\d+)?))?/, async (msg, match) => {
     );
   }
 
-  // Recalculate direction
-  const direction = currentPrice < newPrice ? "above" : "below";
-  
-  // Update trigger
-  trigger.targetPrice = newPrice;
-  trigger.direction = direction;
-  writeTriggers(triggers);
+  if (dirInput) {
+    let direction = "above";
+    if (["below", "down", "go_below"].includes(dirInput.toLowerCase())) {
+      direction = "below";
+    }
 
+    trigger.targetPrice = newPrice;
+    trigger.direction = direction;
+    writeTriggers(triggers);
+
+    return bot.sendMessage(
+      chatId,
+      `✅ **Alert Updated Successfully!**\n\n` +
+      `🪙 Symbol: *${trigger.symbol}*\n` +
+      `💵 Current Price: *$${currentPrice}*\n` +
+      `🎯 New Target Price: *$${newPrice}*\n` +
+      `🔔 Trigger Condition: When price goes *${direction === "above" ? "above 📈" : "below 📉"}*`,
+      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    );
+  }
+
+  // Prompt for manual direction selection using inline buttons
+  userStates[chatId] = { action: "edit_direction", alertId: trigger.id, symbol: trigger.symbol, newPrice, currentPrice };
+  const inlineKeyboard = [
+    [
+      { text: "📈 Go Above", callback_data: "editdir_above" },
+      { text: "📉 Go Below", callback_data: "editdir_below" }
+    ]
+  ];
   bot.sendMessage(
     chatId,
-    `✅ **Alert Updated Successfully!**\n\n` +
-    `🪙 Symbol: *${trigger.symbol}*\n` +
-    `💵 Current Price: *$${currentPrice}*\n` +
     `🎯 New Target Price: *$${newPrice}*\n` +
-    `🔔 Trigger Condition: When price goes *${direction === "above" ? "above 📈" : "below 📉"}*`,
-    { parse_mode: "Markdown", reply_markup: mainKeyboard }
+    `Current price of *${trigger.symbol}* is *$${currentPrice}*.\n\n` +
+    `Choose when to trigger the alert:`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: inlineKeyboard
+      }
+    }
   );
 });
 
@@ -496,6 +549,83 @@ bot.on("callback_query", async (callbackQuery) => {
         { reply_markup: mainKeyboard }
       );
     }
+  } else if (data.startsWith("setdir_")) {
+    const direction = data.substring(7); // "above" or "below"
+    const state = userStates[chatId];
+    if (!state || state.action !== "add_direction") {
+      return bot.sendMessage(chatId, "❌ Wizard session expired or invalid. Please add alert again.", { reply_markup: mainKeyboard });
+    }
+
+    const { symbol, targetPrice, currentPrice } = state;
+    userStates[chatId] = null; // Clear state
+
+    const newTrigger = {
+      id: Date.now().toString(),
+      symbol,
+      targetPrice,
+      direction,
+      chatId,
+      createdAt: new Date().toISOString()
+    };
+
+    const triggers = readTriggers();
+    triggers.push(newTrigger);
+    writeTriggers(triggers);
+
+    const dirText = direction === "above" ? "above 📈" : "below 📉";
+    const successMsg = `✅ **Alert Added Successfully!**\n\n` +
+                       `🪙 Symbol: *${symbol}*\n` +
+                       `💵 Current Price: *$${currentPrice}*\n` +
+                       `🎯 Target Price: *$${targetPrice}*\n` +
+                       `🔔 Trigger Condition: When price goes *${dirText}*\n` +
+                       `🆔 Alert ID: \`${newTrigger.id}\``;
+
+    // Edit the inline button message to show success
+    await bot.editMessageText(successMsg, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: "Markdown"
+    });
+    
+    // Also send a dummy message to keep the main keyboard present
+    await bot.sendMessage(chatId, "Use main keyboard for further actions.", { reply_markup: mainKeyboard });
+
+  } else if (data.startsWith("editdir_")) {
+    const direction = data.substring(8); // "above" or "below"
+    const state = userStates[chatId];
+    if (!state || state.action !== "edit_direction") {
+      return bot.sendMessage(chatId, "❌ Wizard session expired or invalid. Please edit alert again.", { reply_markup: mainKeyboard });
+    }
+
+    const { alertId, symbol, newPrice, currentPrice } = state;
+    userStates[chatId] = null; // Clear state
+
+    const triggers = readTriggers();
+    const triggerIdx = triggers.findIndex(t => t.id === alertId && t.chatId === chatId);
+
+    if (triggerIdx === -1) {
+      return bot.sendMessage(chatId, "❌ Alert not found or was deleted during edit.", { reply_markup: mainKeyboard });
+    }
+
+    const trigger = triggers[triggerIdx];
+    trigger.targetPrice = newPrice;
+    trigger.direction = direction;
+    writeTriggers(triggers);
+
+    const dirText = direction === "above" ? "above 📈" : "below 📉";
+    const successMsg = `✅ **Alert Updated Successfully!**\n\n` +
+                       `🪙 Symbol: *${symbol}*\n` +
+                       `💵 Current Price: *$${currentPrice}*\n` +
+                       `🎯 New Target Price: *$${newPrice}*\n` +
+                       `🔔 Trigger Condition: When price goes *${dirText}*`;
+
+    await bot.editMessageText(successMsg, {
+      chat_id: chatId,
+      message_id: messageId,
+      parse_mode: "Markdown"
+    });
+
+    await bot.sendMessage(chatId, "Use main keyboard for further actions.", { reply_markup: mainKeyboard });
   }
 });
 
@@ -564,7 +694,7 @@ bot.on("message", async (msg) => {
     if (price === null) {
       return bot.sendMessage(
         chatId, 
-        `❌ Symbol *${symbol}* MEXC API par nahi mila.`, 
+        `❌ Symbol *${symbol}* not found on MEXC API.`, 
         { parse_mode: "Markdown", reply_markup: mainKeyboard }
       );
     }
@@ -593,7 +723,7 @@ bot.on("message", async (msg) => {
     if (price === null) {
       return bot.sendMessage(
         chatId,
-        `❌ Symbol *${symbol}* MEXC par nahi mila.\n\nPlease enter a valid symbol (e.g. BTC, ETH, SIRENUSDT):`,
+        `❌ Symbol *${symbol}* not found on MEXC.\n\nPlease enter a valid symbol (e.g. BTC, ETH, SIRENUSDT):`,
         { reply_markup: mainKeyboard }
       );
     }
@@ -618,32 +748,26 @@ bot.on("message", async (msg) => {
       );
     }
 
-    userStates[chatId] = null; // Clear state
+    // Instead of completing, transition to choosing direction
+    userStates[chatId] = { action: "add_direction", symbol, targetPrice, currentPrice };
 
-    const direction = currentPrice < targetPrice ? "above" : "below";
-    const newTrigger = {
-      id: Date.now().toString(),
-      symbol,
-      targetPrice,
-      direction,
-      chatId,
-      createdAt: new Date().toISOString()
-    };
-
-    const triggers = readTriggers();
-    triggers.push(newTrigger);
-    writeTriggers(triggers);
-
-    const dirText = direction === "above" ? "above 📈" : "below 📉";
+    const inlineKeyboard = [
+      [
+        { text: "📈 Go Above", callback_data: "setdir_above" },
+        { text: "📉 Go Below", callback_data: "setdir_below" }
+      ]
+    ];
     bot.sendMessage(
       chatId,
-      `✅ **Alert Added Successfully!**\n\n` +
-      `🪙 Symbol: *${symbol}*\n` +
-      `💵 Current Price: *$${currentPrice}*\n` +
       `🎯 Target Price: *$${targetPrice}*\n` +
-      `🔔 Trigger Condition: When price goes *${dirText}*\n` +
-      `🆔 Alert ID: \`${newTrigger.id}\``,
-      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+      `Current price of *${symbol}* is *$${currentPrice}*.\n\n` +
+      `Choose when to trigger the alert:`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: inlineKeyboard
+        }
+      }
     );
 
   } else if (state.action === "edit_price") {
@@ -660,24 +784,11 @@ bot.on("message", async (msg) => {
       );
     }
 
-    userStates[chatId] = null; // Clear state
-
-    const triggers = readTriggers();
-    const triggerIdx = triggers.findIndex(t => t.id === alertId && t.chatId === chatId);
-
-    if (triggerIdx === -1) {
-      return bot.sendMessage(
-        chatId, 
-        "❌ Alert not found or was deleted during edit.",
-        { reply_markup: mainKeyboard }
-      );
-    }
-
-    const trigger = triggers[triggerIdx];
-    bot.sendMessage(chatId, `⏳ Fetching live price for *${symbol}* to recalculate trigger condition...`, { parse_mode: "Markdown" });
+    bot.sendMessage(chatId, `⏳ Fetching live price for *${symbol}*...`, { parse_mode: "Markdown" });
 
     const currentPrice = await verifySymbolAndGetPrice(symbol);
     if (currentPrice === null) {
+      userStates[chatId] = null;
       return bot.sendMessage(
         chatId, 
         `❌ Error: Could not fetch price. Try editing using \`/edit ${alertId} ${newPrice}\``, 
@@ -685,19 +796,26 @@ bot.on("message", async (msg) => {
       );
     }
 
-    const direction = currentPrice < newPrice ? "above" : "below";
-    trigger.targetPrice = newPrice;
-    trigger.direction = direction;
-    writeTriggers(triggers);
+    // Instead of completing, transition to choosing direction
+    userStates[chatId] = { action: "edit_direction", alertId, symbol, newPrice, currentPrice };
 
+    const inlineKeyboard = [
+      [
+        { text: "📈 Go Above", callback_data: "editdir_above" },
+        { text: "📉 Go Below", callback_data: "editdir_below" }
+      ]
+    ];
     bot.sendMessage(
       chatId,
-      `✅ **Alert Updated Successfully!**\n\n` +
-      `🪙 Symbol: *${symbol}*\n` +
-      `💵 Current Price: *$${currentPrice}*\n` +
       `🎯 New Target Price: *$${newPrice}*\n` +
-      `🔔 Trigger Condition: When price goes *${direction === "above" ? "above 📈" : "below 📉"}*`,
-      { parse_mode: "Markdown", reply_markup: mainKeyboard }
+      `Current price of *${symbol}* is *$${currentPrice}*.\n\n` +
+      `Choose when to trigger the alert:`,
+      {
+        parse_mode: "Markdown",
+        reply_markup: {
+          inline_keyboard: inlineKeyboard
+        }
+      }
     );
   }
 });
